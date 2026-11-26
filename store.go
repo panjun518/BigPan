@@ -172,6 +172,7 @@ type Store struct {
 	// 现在：锁内只 marshal（毫秒级），写盘交给单个后台协程，短时间多次变更合并
 	// 成一次写，并先写临时文件再 rename（避免写一半断电留个坏 JSON）。
 	saveQ     chan struct{}
+	saveMu    sync.Mutex // Flush 与后台写盘互斥，保证 Flush 返回后不会再有一次写盘
 	pendingMu sync.Mutex
 	pending   []Item
 	lastN     int64 // 上次落盘时的条目数（用来决定合并窗口）
@@ -334,15 +335,18 @@ func (s *Store) saveLoop() {
 		// 等这一下就能只写一次盘。库越大（JSON 越大），marshal+写盘越久，
 		// 窗口同步拉长，避免「刚写完又立刻重写」把 eMMC 打满。
 		time.Sleep(storeSaveDelay(int(atomic.LoadInt64(&s.lastN))))
+		s.saveMu.Lock()
+		// 取 pending 必须在 saveMu 之内：否则可能 Flush 已写完新快照，
+		// 后台拿着 sleep 前取到的旧快照再写一遍，把数据回滚回去。
 		s.pendingMu.Lock()
 		snap := s.pending
 		s.pending = nil
 		s.pendingMu.Unlock()
-		if snap == nil {
-			continue
+		if snap != nil {
+			atomic.StoreInt64(&s.lastN, int64(len(snap)))
+			s.writeSnapshot(snap)
 		}
-		atomic.StoreInt64(&s.lastN, int64(len(snap)))
-		s.writeSnapshot(snap)
+		s.saveMu.Unlock()
 	}
 }
 
@@ -388,7 +392,22 @@ func (s *Store) writeSnapshot(snap []Item) {
 }
 
 // Flush 把待写数据立即落盘（退出前调用，避免丢最后一批变更）。
+//
+// 必须先排空 saveQ 并拿到 saveMu：否则后台协程可能正卡在合并窗口的 sleep 里，
+// Flush 写完它醒来又拿旧快照写一遍 —— CI 上表现为测试 TempDir 清理时
+// 「directory not empty」，且落盘日志报「写 ... no such file or directory」。
 func (s *Store) Flush() {
+	for {
+		select {
+		case <-s.saveQ: // 丢弃后台待处理的信号，下面自己同步写
+			continue
+		default:
+		}
+		break
+	}
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+
 	s.pendingMu.Lock()
 	snap := s.pending
 	s.pending = nil
