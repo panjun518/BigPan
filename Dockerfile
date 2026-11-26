@@ -3,8 +3,13 @@ FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
 WORKDIR /src
 COPY . .
 ARG TARGETOS TARGETARCH
+ARG VERSION=dev
+ARG COMMIT=none
+ARG BUILD_TIME=unknown
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
-    go build -mod=vendor -trimpath -ldflags="-s -w" -o /out/bigpan .
+    go build -mod=vendor -trimpath \
+    -ldflags="-s -w -X main.buildVersion=${VERSION} -X main.buildCommit=${COMMIT} -X main.buildTime=${BUILD_TIME}" \
+    -o /out/bigpan .
 
 # ---- 证书与时区（数据文件与架构无关）----
 FROM --platform=$BUILDPLATFORM alpine:3.19 AS certs

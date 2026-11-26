@@ -16,6 +16,12 @@ import (
 )
 
 func TestDbTaskWritesBackCache(t *testing.T) {
+	// 真机测试：默认跳过。需要真跑时设 BIGPAN_LIVE=1 并准备 /tmp/dbacc.json。
+	// 原先无条件读这个文件——沙箱里恰好残留一份凭证就会联网扫真实豆包目录，
+	// 撞上限流后 100 秒超时判 FAIL，clone 下来的人 go test 直接红。
+	if os.Getenv("BIGPAN_LIVE") == "" {
+		t.Skip("真机测试：设 BIGPAN_LIVE=1 才跑（需 /tmp/dbacc.json 与可用网络）")
+	}
 	b, err := os.ReadFile("/tmp/dbacc.json")
 	if err != nil {
 		t.Skip("没有 /tmp/dbacc.json")
@@ -50,8 +56,14 @@ func TestDbTaskWritesBackCache(t *testing.T) {
 		t.Fatal("任务没起来")
 	}
 
-	// 等后台再扫一段
-	time.Sleep(55 * time.Second)
+	// 等后台再扫一段：轮询到「比第一段多」就继续，不必死等 55 秒
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		if cur := task.asShareInfo(); len(cur.Files) > len(files) {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 	snap := task.asShareInfo()
 	t.Logf("后台扫了一段后：job=%d 个文件", len(snap.Files))
 

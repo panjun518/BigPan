@@ -606,13 +606,7 @@ func directGuard(store *Store) http.Handler {
 				// 百度 + 浏览器 + 用户开启了代取开关 → 本机转发，不回 302。
 				// 见 STRMConfig.BaiduBrowserRelay 的说明（默认关闭，只影响百度）。
 				if wantBrowserRelay(it, r) {
-					ua, ck := *flagUA, ""
-					if pt := getPlayTarget(it.ID); pt != nil {
-						if pt.ua != "" {
-							ua = pt.ua
-						}
-						ck = pt.cookie
-					}
+					ua, ck := baiduRelayCredentials(it)
 					log.Printf("  [直链] %s → 浏览器代取（数据经过本机）", it.FileName())
 					proxyBaiduRelay(w, r, u, ua, ck)
 					return
@@ -979,7 +973,17 @@ func proxyPlain(w http.ResponseWriter, r *http.Request, target, ua string, hc *h
 // ---------------------------------------------------------------------------
 
 // wantBrowserRelay 判断本次请求是否要走百度代取。
-// 三个条件缺一不可：配置开启、条目属于百度、请求方是浏览器。
+//
+// 【2026-11-06 修正】原来要求 UA「必须是浏览器」才代取，结果飞牛影视网页版
+// 这类「服务端转发 + 前端播放」的形态全部漏网：飞牛后端代取时 UA 是它自己
+// 的（Go-http-client / fnOS 自有串），isBrowserUA 判 false → 照样 302 →
+// 浏览器跟着跳到百度 → 403。开关开了却播不了，根因就在这里。
+//
+// 现在反过来判：只要开关开着，百度一律代取，**只放行已知能自己处理 302 的
+// 媒体播放器/服务器**（Emby、Kodi、VLC、Infuse、Plex、ExoPlayer 之流——
+// 百度不拦它们的 UA，让它们走代取纯属白吃带宽）。
+// 未知客户端（含飞牛、浏览器、Go-http-client、空 UA）一律代取：宁可多花
+// 一点中转流量，也不能让「开关开着仍播不了」再发生。
 func wantBrowserRelay(it *Item, r *http.Request) bool {
 	if it == nil || !strmCfg.BaiduBrowserRelay {
 		return false
@@ -990,7 +994,29 @@ func wantBrowserRelay(it *Item, r *http.Request) bool {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		return false
 	}
-	return isBrowserUA(r.Header.Get("User-Agent"))
+	return !isMediaPlayerUA(r.Header.Get("User-Agent"))
+}
+
+// isMediaPlayerUA 判断 UA 是否来自自带解码器、能自己跟随 302 的播放器/媒体服务器。
+//
+// 这些客户端是百度 302 直连的合法受益者：让它们走代取只会把视频流量白灌进
+// 部署机（甲骨文按出网流量计费）。除此之外的一切 UA（包括空 UA）都不在此列，
+// 由 wantBrowserRelay 统一走去代取。
+func isMediaPlayerUA(ua string) bool {
+	if ua == "" {
+		return false
+	}
+	low := strings.ToLower(ua)
+	for _, kw := range []string{
+		"kodi", "infuse", "vlc", "libvlc", "emby", "jellyfin", "plex",
+		"exoplayer", "dalvik", "libmpv", "mpv/", "ffmpeg", "lavf",
+		"fileball", "vidhub", "senplayer", "nplayer",
+	} {
+		if strings.Contains(low, kw) {
+			return true
+		}
+	}
+	return false
 }
 
 // isBrowserUA 判断 UA 是否来自浏览器。
@@ -1021,6 +1047,26 @@ func isBrowserUA(ua string) bool {
 		}
 	}
 	return false
+}
+
+// baiduRelayCredentials 选出代取百度直链时应使用的 UA 与 Cookie。
+//
+// 【2026-11-06 修正】兜底 UA 原来是 *flagUA，而 flagUA 的默认值是 **Chrome
+// 浏览器 UA**——百度按 UA 白名单拦，拿它去代取等于把 403 从客户端原封不动搬
+// 到服务端：开关开了、代取也触发了，上游照样回
+// `hit black userlist, hit illeage dlna`，用户侧表现就是「开关打开了还是播不了」。
+//
+// 兜底必须是百度网盘安卓 UA（百度不拦）；解析缓存里有更精确的 UA（分享条目
+// 由 ResolvePlay 返回 baiduNetUA）时用它覆盖。
+func baiduRelayCredentials(it *Item) (ua, cookie string) {
+	ua = baiduNetUA
+	if pt := getPlayTarget(it.ID); pt != nil {
+		if pt.ua != "" {
+			ua = pt.ua
+		}
+		cookie = pt.cookie
+	}
+	return ua, cookie
 }
 
 // proxyBaiduRelay 带网盘 UA 代取百度直链并把字节转发给调用方。
@@ -1571,6 +1617,13 @@ func main() {
 	}
 
 	flag.Parse()
+	if *flagVersion {
+		printVersion()
+		return
+	}
+	if *flagHealthz {
+		os.Exit(healthcheckExit(*flagPort))
+	}
 	log.SetFlags(log.Ltime)
 	if *flagDbGap > 0 {
 		doubaoGap = time.Duration(*flagDbGap) * time.Millisecond
@@ -1649,6 +1702,8 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", healthz)
+	mux.HandleFunc("/api/version", requireAuth(apiVersion))
 	mux.HandleFunc("/play", handlePlay(store, as))
 	// 带文件名的形式（/play/电影名.mkv?id=xxx）：媒体服务器按 URL 后缀挑解码器，
 	// 纯 /play?id= 没有后缀会被判成「未知格式」拒绝播放。路径部分仅作装饰。

@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 // 默认配置下，任何请求都不能走代取（守住的底线：不改配置 = 行为与改动前一致）。
@@ -38,7 +39,8 @@ func TestWantBrowserRelayOnlyBaidu(t *testing.T) {
 	}
 }
 
-// 媒体服务器与命令行工具必须始终走 302，不被代取。
+// 已知媒体播放器/服务器必须始终走 302，不被代取（它们自己会跟 302，
+// 让它们走代取等于白烧部署机带宽）。
 func TestWantBrowserRelaySkipsMediaServers(t *testing.T) {
 	old := strmCfg.BaiduBrowserRelay
 	defer func() { strmCfg.BaiduBrowserRelay = old }()
@@ -47,18 +49,42 @@ func TestWantBrowserRelaySkipsMediaServers(t *testing.T) {
 	uas := []string{
 		"Kodi/20.0 (Linux; Android 11) Android/11.0.0 Sys_CPU/arm64-v8a",
 		"Emby/4.7.14.0 (Linux; Android 11) Android/11 ExoPlayerLib/2.18.1",
+		"EmbyServer/4.10.2",
 		"Infuse/7.6", "VLC/3.0.20 LibVLC/3.0.20",
-		"okhttp/4.9.0", "Dalvik/2.1.0 (Linux; U; Android 11)",
-		"curl/7.68.0", "Go-http-client/2.0", "python-requests/2.31",
-		"Lavf/59.27.100", "libmpv", "",
+		"Dalvik/2.1.0 (Linux; U; Android 11)",
+		"Lavf/59.27.100", "libmpv", "Fileball/1.0", "VidHub/2.0",
+	}
+	for _, ua := range uas {
+		r := httptest.NewRequest(http.MethodGet, "/direct/a.mkv", nil)
+		r.Header.Set("User-Agent", ua)
+		if wantBrowserRelay(&Item{Provider: "baidu"}, r) {
+			t.Fatalf("媒体播放器不应代取: %q", ua)
+		}
+	}
+}
+
+// 【2026-11-06】开关打开后，除已知播放器外一律代取——包括飞牛后端这类
+// 「不是浏览器」的 UA。此前只认浏览器 UA，导致飞牛影视网页版开了开关也播不了。
+func TestWantBrowserRelayCoversNonBrowserClients(t *testing.T) {
+	old := strmCfg.BaiduBrowserRelay
+	defer func() { strmCfg.BaiduBrowserRelay = old }()
+	strmCfg.BaiduBrowserRelay = true
+
+	uas := []string{
+		"",                                   // 空 UA
+		"Go-http-client/2.0",                 // 飞牛/各类服务端转发的典型 UA
+		"fnOS-Media/1.0",                     // 飞牛自有 UA 形态
+		"curl/7.68.0",                        // 探测工具
+		"python-requests/2.31",               // 探测脚本
+		"Apache-HttpClient/4.5.13 (Java/11)", // 第三方 App 的 HTTP 栈
 	}
 	for _, ua := range uas {
 		r := httptest.NewRequest(http.MethodGet, "/direct/a.mkv", nil)
 		if ua != "" {
 			r.Header.Set("User-Agent", ua)
 		}
-		if wantBrowserRelay(&Item{Provider: "baidu"}, r) {
-			t.Fatalf("媒体服务器/工具不应代取: %q", ua)
+		if !wantBrowserRelay(&Item{Provider: "baidu"}, r) {
+			t.Fatalf("未知客户端应走代取（否则开了开关仍播不了）: %q", ua)
 		}
 	}
 }
@@ -139,5 +165,32 @@ func TestProxyBaiduRelayUpstreamError(t *testing.T) {
 
 	if w.Code != http.StatusBadGateway {
 		t.Fatalf("上游 403 时应回 502，实际 %d", w.Code)
+	}
+}
+
+// 【2026-11-06】代取兜底 UA 必须是百度网盘 UA，不能是 flagUA（浏览器 UA）。
+// 回归用例：曾经用 *flagUA 兜底，开关开了代取也触发了，百度照样 403，
+// 表现为「打开开关还是不播」。
+func TestBaiduRelayCredentialsFallsBackToNetdiskUA(t *testing.T) {
+	id := "test-relay-cred"
+	dropPlayTarget(id)
+	t.Cleanup(func() { dropPlayTarget(id) })
+
+	ua, ck := baiduRelayCredentials(&Item{ID: id, Provider: "baidu"})
+	if ua != baiduNetUA {
+		t.Fatalf("缓存未命中时兜底 UA 必须是网盘 UA，实际 %q", ua)
+	}
+	if ck != "" {
+		t.Fatalf("缓存未命中时不应有 Cookie，实际 %q", ck)
+	}
+
+	putPlayTarget(id, &playTarget{
+		url: "http://example.invalid/a.mp4",
+		ua:  "netdisk;custom;android;",
+		exp: time.Now().Add(time.Minute),
+	})
+	ua, _ = baiduRelayCredentials(&Item{ID: id, Provider: "baidu"})
+	if ua != "netdisk;custom;android;" {
+		t.Fatalf("缓存命中时应使用缓存 UA，实际 %q", ua)
 	}
 }

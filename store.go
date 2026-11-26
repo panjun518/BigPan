@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"log"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -345,17 +346,45 @@ func (s *Store) saveLoop() {
 	}
 }
 
+// backupPrev 保留上一版数据文件。
+//
+// 用硬链接而不是复制：线上 items.json 已有 24MB，盒子 eMMC 写速仅 2.7MB/s，
+// 每次落盘多复制一份等于把写盘量直接翻倍。硬链接是纯元数据操作，瞬时完成：
+// link 之后 .bak 指向旧 inode，随后 rename 让主文件指向新 inode，旧内容被
+// .bak 稳稳留住，全程不搬一个字节。
+func backupPrev(path string) {
+	bak := path + ".bak"
+	if _, err := os.Stat(path); err != nil {
+		return // 首次运行没有上一版，正常
+	}
+	_ = os.Remove(bak) // 清掉更早那份；失败不阻断
+	if err := os.Link(path, bak); err != nil {
+		log.Printf("[store] 备份上一版失败（不阻断落盘）：%v", err)
+		return
+	}
+	_ = os.Chmod(bak, 0600) // 备份里同样含分享链接与提取码
+}
+
 // writeSnapshot 一次原子落盘（临时文件 + rename，避免写一半断电留坏 JSON）。
+// 以前 Marshal/WriteFile/Rename 三处失败都静默 return：磁盘满或目录只读时
+// 条目全丢且日志一声不吭。现在每条失败都打日志，并留一份上一版可手工捞回。
 func (s *Store) writeSnapshot(snap []Item) {
 	b, err := json.Marshal(snap)
 	if err != nil {
+		log.Printf("[store] 落盘失败：JSON 序列化：%v", err)
 		return
 	}
 	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0644); err != nil {
+	if err := os.WriteFile(tmp, b, 0600); err != nil {
+		log.Printf("[store] 落盘失败：写 %s：%v（磁盘满 / 目录只读？条目仍在内存，重启会丢）", tmp, err)
 		return
 	}
-	_ = os.Rename(tmp, s.path)
+	backupPrev(s.path)
+	if err := os.Rename(tmp, s.path); err != nil {
+		log.Printf("[store] 落盘失败：rename %s：%v（条目仍在内存，重启会丢）", tmp, err)
+		return
+	}
+	_ = os.Chmod(s.path, 0600)
 }
 
 // Flush 把待写数据立即落盘（退出前调用，避免丢最后一批变更）。
@@ -618,14 +647,14 @@ func itoa(n int64) string {
 
 // ShareSummary 一条已导入分享的概要（由条目聚合而来），供追更刷新。
 type ShareSummary struct {
-	Provider  string `json:"provider"`
-	ShareID   string `json:"share_id"`
-	Passcode  string `json:"passcode,omitempty"`
-	Category  string `json:"category,omitempty"` // 分类（如 国产剧/欧美剧）
+	Provider string `json:"provider"`
+	ShareID  string `json:"share_id"`
+	Passcode string `json:"passcode,omitempty"`
+	Category string `json:"category,omitempty"` // 分类（如 国产剧/欧美剧）
 	// Group 目录单元：同一个分享按目录导入多次时，用它把每块分成独立一行。
 	// 值 = 条目目录的第二段（豆包1/电视剧/… → 电视剧）。空 = 整分享导入的老数据。
 	Group     string `json:"group,omitempty"`
-	ShowName  string `json:"show_name"`          // 剧名
+	ShowName  string `json:"show_name"` // 剧名
 	Files     int    `json:"files"`
 	LastAdded string `json:"last_added"`
 	// ShareURL 反构出的原始分享链接，前端剧名超链接到网盘原页面用。

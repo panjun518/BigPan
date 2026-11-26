@@ -28,13 +28,15 @@ func TestQTVSignShape(t *testing.T) {
 	if _, token2, _ := q.qtvSign("GET", "/oauth/authorize"); token == token2 {
 		// 允许：同一毫秒。换个路径必须不同。
 	}
-	_, tokenGet, _ := q.qtvSign("GET", "/file")
+	// 每次 qtvSign 都取当前毫秒，跨毫秒边界时间戳就变。必须用「这次签名自己的
+	// 时间戳」算期望值；以前拿第一次的 tm 去比第三次的结果，跨毫秒就偶发 FAIL。
+	tmGet, tokenGet, _ := q.qtvSign("GET", "/file")
 	_, tokenPost, _ := q.qtvSign("POST", "/file")
 	if tokenGet == tokenPost {
 		t.Fatal("不同方法应签出不同 token")
 	}
 	// token 应等于手工计算的 sha256
-	sum := sha256.Sum256([]byte("GET&/file&" + tm + "&" + qtvSignKey))
+	sum := sha256.Sum256([]byte("GET&/file&" + tmGet + "&" + qtvSignKey))
 	want := hex.EncodeToString(sum[:])
 	if tokenGet != want {
 		t.Fatalf("token 与手工计算不一致:\n got  %s\n want %s", tokenGet, want)
@@ -81,12 +83,12 @@ func TestQTVTokenInvalid(t *testing.T) {
 func TestQTVQRSessionLifecycle(t *testing.T) {
 	// 直接造会话（不碰网络）：验证快照字段与 GC 行为
 	s := &qtvQRSession{
-		id:        "t1",
-		status:    0,
-		message:   "等待扫码",
-		label:     "data:image/jpeg;base64,AAA",
-		created:   time.Now(),
-		qtv:       NewQuarkTV("d", "", ""),
+		id:         "t1",
+		status:     0,
+		message:    "等待扫码",
+		label:      "data:image/jpeg;base64,AAA",
+		created:    time.Now(),
+		qtv:        NewQuarkTV("d", "", ""),
 		queryToken: "qt",
 	}
 	qtvQRMu.Lock()
